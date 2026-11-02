@@ -1,249 +1,228 @@
-/* ASCII flow background — canvas 2D, no dependencies.
-   Each character is rendered as a monospace glyph.
-   The flow follows level sets of an analytic stream function: u = dψ/dy, v = -dψ/dx.
-   Color/density is modulated along those streamlines to produce the ridged, fluid appearance.
-*/
+/* Analytic flow contours rendered as ASCII glyphs on a canvas. */
 (() => {
   'use strict';
-  const canvas = document.getElementById('ascii-flow');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d', { alpha: false });
-  if (!ctx) return;
 
-  const defaults = { density: 1, speed: 0.9, contrast: 1.1, cellSize: 8 };
-  const params = { ...defaults };
-  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
-  let cssW = 0, cssH = 0, dpr = 1, cols = 0, rows = 0, cellW = 0, cellH = 0;
-  let running = false, frame = 0, lastTime = 0, elapsed = 0;
-  let charCache = [];
-  let xCoords, yCoords, wavePhases, waveYDerivatives, broadPhase, grains;
-  const alphaColors = Array.from({ length: 256 }, (_, alpha) => `rgba(218,224,227,${alpha / 255})`);
+  // Visual tuning. Flow coordinates are normalized to the shorter canvas edge.
+  const DEFAULTS = { density: 1, speed: 0.9, contrast: 1.1, cellSize: 8 };
+  const FLOW = {
+    current: 0.25,
+    waves: [
+      { amplitude: 0.07, x: 3.2, y: 0, warp: 1.15, warpFrequency: 1.75, speed: -0.18 },
+      { amplitude: 0.05, x: -1.2, y: 3.45, speed: 0.12 }
+    ],
+    // [center x, center y, radius, strength]; positive y points down.
+    vortices: [
+      [-1.12, 0.34, 1.10, 0.78], [0.88, -0.38, 1.15, -0.93],
+      [1.23, 0.66, 0.32, 0.35], [-0.3, -0.92, 0.35, -0.30],
+      [0.10, 0.42, 0.28, 0.28]
+    ],
+    vortexDrift: { x: 0.045, y: 0.037, xSpeed: 0.12, ySpeed: 0.14, xPhase: 2.3, yPhase: 1.8 },
+    bands: { frequency: 30.5, sharpness: 3.3, speed: 0.3 }
+  };
+  const STYLE = {
+    background: '#0a0b0d', glyphColor: '218,224,227', alphaSteps: 255,
+    fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+    minFontSize: 9, fontScale: 0.92, cellAspect: 1.28, maxPixelRatio: 2,
+    coordinateScale: 0.62, gridPadding: 1,
+    broadX: 2.8, broadY: -2.1, broadSpeed: 0.13, grainX: 12, grainY: 8.4,
+    densityBase: 0.12, densityBands: 0.67, densityGrain: 0.2, maxDensity: 0.99,
+    sparseGlyphThreshold: 0.15, lightGlyphThreshold: 0.88,
+    luminanceBase: 0.17, luminanceBands: 0.56, luminanceBroad: 0.12,
+    grainAlphaBase: 0.65, grainAlphaWeight: 0.35, minAlpha: 0.045, maxAlpha: 0.9
+  };
+  const ANIMATION = { framesPerSecond: 24, maxDeltaSeconds: 0.08 };
+  const ALPHA_COLORS = Array.from({ length: STYLE.alphaSteps + 1 }, (_, alpha) =>
+    `rgba(${STYLE.glyphColor},${alpha / STYLE.alphaSteps})`);
 
+  // Stable cell noise: the integer constants are the hash algorithm's mixing constants.
   function hash(x, y) {
-    // Deterministic pseudo-random noise per character cell.
     let v = Math.imul(x + 17, 374761393) + Math.imul(y + 29, 668265263);
     v = Math.imul(v ^ (v >>> 13), 1274126177);
     return ((v ^ (v >>> 16)) >>> 0) / 4294967296;
   }
 
-  // Tune these values to reshape the flow. Vortices are [x, y, radius, strength].
-  // Geometry is cached during measure(), so reload after changing these values.
-  const flow = {
-    current: 0.25,
-    // x/y control spatial frequency; optional warp bends the wave along y.
-    waves: [
-      { amplitude: 0.07, x: 3.2, y: 0, warp: 1.15, warpFrequency: 1.75, speed: -0.18 },
-      { amplitude: 0.05, x: -1.2, y: 3.45, speed: 0.12 },
-      // { amplitude: 0.03, x: 2.8, y: 3.8, speed: 0.075 },
-    ],
-    vortexDrift: { x: 0.045, y: 0.037, xSpeed: 0.12, ySpeed: 0.14, xPhase: 2.3, yPhase: 1.8 },
-    bands: { frequency: 30.5, sharpness: 3.3, speed: 0.3 }
-  };
-  // Each vortex is [x, y, radius, strength]: x/y locate its center in normalized
-  // flow coordinates (positive y is down); radius controls its spread, and the
-  // sign and magnitude of strength control its direction and intensity.
-  const vortices = [
-    // Two broad, low-frequency swirls.
-    [-1.12, 0.34, 1.10, 0.78],
-    [0.88, -0.38, 1.15, -0.93],
-    // Three smaller, high-frequency swirls.
-    [1.23, 0.66, 0.32, 0.35],
-    [-0.3, -0.92, 0.35, -0.30],
-    [0.10, 0.42, 0.28, 0.28]
-  ];
-
-  const vortexRadiusSquared = vortices.map(([, , radius]) => radius * radius);
-  // Updated once per draw; shared by the stream and gradient calculations.
-  const vortexX = new Float64Array(vortices.length);
-  const vortexY = new Float64Array(vortices.length);
-  // Reused immediately for the current cell's gradient, when needed.
-  const vortexContributions = new Float64Array(vortices.length);
-
-  function stream(x, y, t, index) {
-    let psi = flow.current * y;
-    for (let i = 0; i < flow.waves.length; i++) {
-      const wave = flow.waves[i];
-      psi += wave.amplitude * Math.sin(wavePhases[i][index] + t * wave.speed);
-    }
-    for (let i = 0; i < vortices.length; i++) {
-      const amp = vortices[i][3];
-      const dx = x - vortexX[i];
-      const dy = y - vortexY[i];
-      const contribution = amp * Math.exp(-(dx * dx + dy * dy) / vortexRadiusSquared[i]);
-      vortexContributions[i] = contribution;
-      psi += contribution;
-    }
-    return psi;
-  }
-
-  function streamGradient(x, y, t, index, row) {
-    let dxPsi = 0;
-    let dyPsi = flow.current;
-    for (let i = 0; i < flow.waves.length; i++) {
-      const wave = flow.waves[i];
-      const derivative = wave.amplitude * Math.cos(wavePhases[i][index] + t * wave.speed);
-      dxPsi += wave.x * derivative;
-      dyPsi += waveYDerivatives[i][row] * derivative;
-    }
-    for (let i = 0; i < vortices.length; i++) {
-      const dx = x - vortexX[i];
-      const dy = y - vortexY[i];
-      const factor = -2 * vortexContributions[i] / vortexRadiusSquared[i];
-      dxPsi += factor * dx;
-      dyPsi += factor * dy;
-    }
-    return [dxPsi, dyPsi];
-  }
-
-  function measure() {
+  // Compute the canvas size and return its dimensions. A hidden canvas has no grid.
+  function initializeCanvas(canvas, ctx, pixelRatio, style) {
     const rect = canvas.getBoundingClientRect();
-    cssW = Math.round(rect.width);
-    cssH = Math.round(rect.height);
-    if (!cssW || !cssH) return;
-    dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(cssW * dpr);
-    canvas.height = Math.round(cssH * dpr);
+    const width = Math.round(rect.width), height = Math.round(rect.height);
+    if (!width || !height) return null;
+    const dpr = Math.min(pixelRatio || 1, style.maxPixelRatio);
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    cellW = params.cellSize;
-    cellH = params.cellSize * 1.28;
-    cols = Math.ceil(cssW / cellW) + 1;
-    rows = Math.ceil(cssH / cellH) + 1;
-    ctx.font = `${Math.max(9, params.cellSize * 0.92)}px "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    charCache = Array.from({length: cols * rows}, (_, i) => hash(i % cols, Math.floor(i / cols)));
-    const scale = Math.min(cssW, cssH) * 0.62;
-    xCoords = new Float64Array(cols);
-    yCoords = new Float64Array(rows);
-    wavePhases = flow.waves.map(() => new Float64Array(cols * rows));
-    waveYDerivatives = flow.waves.map(() => new Float64Array(rows));
-    broadPhase = new Float64Array(cols * rows);
-    grains = new Float64Array(cols * rows);
-    for (let ix = 0; ix < cols; ix++) {
-      xCoords[ix] = (ix * cellW + cellW * 0.5 - cssW * 0.5) / scale;
-    }
+    return { width, height };
+  }
+
+  // Initialize immutable per-cell geometry and noise for this size and flow.
+  function initializeFlowArrays(size, cellSize, flow, style) {
+    const cellW = cellSize, cellH = cellSize * style.cellAspect;
+    const cols = Math.ceil(size.width / cellW) + style.gridPadding;
+    const rows = Math.ceil(size.height / cellH) + style.gridPadding;
+    const scale = Math.min(size.width, size.height) * style.coordinateScale;
+    const x = new Float64Array(cols), y = new Float64Array(rows);
+    const noise = new Float64Array(cols * rows);
+    const broad = new Float64Array(cols * rows), grain = new Float64Array(cols * rows);
+    const phases = flow.waves.map(() => new Float64Array(cols * rows));
+    const yDerivatives = flow.waves.map(() => new Float64Array(rows));
+    for (let ix = 0; ix < cols; ix++) x[ix] = (ix * cellW + cellW * 0.5 - size.width * 0.5) / scale;
     for (let iy = 0; iy < rows; iy++) {
-      const y = (iy * cellH + cellH * 0.5 - cssH * 0.5) / scale;
-      yCoords[iy] = y;
-      for (let i = 0; i < flow.waves.length; i++) {
-        const wave = flow.waves[i];
-        const warp = wave.warp ?? 0;
-        const frequency = wave.warpFrequency ?? 0;
-        const yPhase = wave.y * y + warp * Math.sin(frequency * y);
-        waveYDerivatives[i][iy] = wave.y + warp * frequency * Math.cos(frequency * y);
-        for (let ix = 0; ix < cols; ix++) {
-          wavePhases[i][iy * cols + ix] = wave.x * xCoords[ix] + yPhase;
-        }
+      y[iy] = (iy * cellH + cellH * 0.5 - size.height * 0.5) / scale;
+      for (let w = 0; w < flow.waves.length; w++) {
+        const wave = flow.waves[w], warp = wave.warp ?? 0, frequency = wave.warpFrequency ?? 0;
+        const yPhase = wave.y * y[iy] + warp * Math.sin(frequency * y[iy]);
+        yDerivatives[w][iy] = wave.y + warp * frequency * Math.cos(frequency * y[iy]);
+        for (let ix = 0; ix < cols; ix++) phases[w][iy * cols + ix] = wave.x * x[ix] + yPhase;
       }
       for (let ix = 0; ix < cols; ix++) {
         const index = iy * cols + ix;
-        const x = xCoords[ix];
-        broadPhase[index] = x * 2.8 - y * 2.1;
-        grains[index] = 0.5 + 0.5 * Math.sin(x * 12 + y * 8.4);
+        noise[index] = hash(ix, iy);
+        broad[index] = x[ix] * style.broadX + y[iy] * style.broadY;
+        grain[index] = 0.5 + 0.5 * Math.sin(x[ix] * style.grainX + y[iy] * style.grainY);
       }
     }
-    draw(elapsed);
+    return { ...size, cellW, cellH, cols, rows, x, y, noise, broad, grain, phases, yDerivatives };
   }
 
-  function draw(t) {
-    if (!cols) return;
-    ctx.fillStyle = '#0a0b0d';
-    ctx.fillRect(0, 0, cssW, cssH);
-    ctx.font = `${Math.max(9, params.cellSize * 0.92)}px "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace`;
+  // Frame-local vortex positions; no state is shared between frame calculations.
+  function positionVortices(flow, time) {
+    const drift = flow.vortexDrift;
+    return flow.vortices.map(([x, y, radius, strength], i) => ({
+      x: x + drift.x * Math.sin(time * drift.xSpeed + i * drift.xPhase),
+      y: y + drift.y * Math.cos(time * drift.ySpeed + i * drift.yPhase),
+      radiusSquared: radius * radius, strength
+    }));
+  }
+
+  // Calculate the value and gradient together, without a call-order dependency.
+  function sampleFlow(grid, flow, vortices, ix, iy, time) {
+    const index = iy * grid.cols + ix, x = grid.x[ix], y = grid.y[iy];
+    let psi = flow.current * y, dx = 0, dy = flow.current;
+    for (let i = 0; i < flow.waves.length; i++) {
+      const wave = flow.waves[i], phase = grid.phases[i][index] + time * wave.speed;
+      psi += wave.amplitude * Math.sin(phase);
+      const derivative = wave.amplitude * Math.cos(phase);
+      dx += wave.x * derivative;
+      dy += grid.yDerivatives[i][iy] * derivative;
+    }
+    for (const vortex of vortices) {
+      const vx = x - vortex.x, vy = y - vortex.y;
+      const contribution = vortex.strength * Math.exp(-(vx * vx + vy * vy) / vortex.radiusSquared);
+      psi += contribution;
+      const factor = -2 * contribution / vortex.radiusSquared;
+      dx += factor * vx;
+      dy += factor * vy;
+    }
+    return { psi, dx, dy };
+  }
+
+  function directionGlyph(dx, dy) {
+    let angle = Math.atan2(-dx, dy);
+    if (angle < 0) angle += Math.PI;
+    return angle < Math.PI / 8 || angle > 7 * Math.PI / 8 ? '⠤'
+      : angle < 3 * Math.PI / 8 ? '⠱' : angle < 5 * Math.PI / 8 ? '⠇' : '⠎';
+  }
+
+  // Pass 3: draw one frame from explicit inputs. Only the canvas is mutated.
+  function drawFrame(ctx, grid, flow, style, params, time) {
+    if (!grid) return;
+    ctx.fillStyle = style.background;
+    ctx.fillRect(0, 0, grid.width, grid.height);
+    ctx.font = `${Math.max(style.minFontSize, params.cellSize * style.fontScale)}px ${style.fontFamily}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-
-    const vd = flow.vortexDrift;
-    for (let i = 0; i < vortices.length; i++) {
-      vortexX[i] = vortices[i][0] + vd.x * Math.sin(t * vd.xSpeed + i * vd.xPhase);
-      vortexY[i] = vortices[i][1] + vd.y * Math.cos(t * vd.ySpeed + i * vd.yPhase);
-    }
-    const drift = t * flow.bands.speed;
-    for (let iy = 0; iy < rows; iy++) {
-      const py = iy * cellH + cellH * 0.5;
-      const y = yCoords[iy];
-      for (let ix = 0; ix < cols; ix++) {
-        const px = ix * cellW + cellW * 0.5;
-        const x = xCoords[ix];
-        const index = iy * cols + ix;
-        const noise = charCache[index];
-        // Coherent curves: this structure is constant along the streamlines.
-        const psi = stream(x, y, t, index);
-        const bands = Math.pow(0.5 + 0.5 * Math.cos(psi * flow.bands.frequency + drift), flow.bands.sharpness);
-        const broad = 0.5 + 0.5 * Math.sin(broadPhase[index] + t * 0.13);
-        const grain = grains[index];
-        const envelope = 0.12 + 0.67 * bands + 0.2 * broad * grain;
-        if (noise > Math.min(0.99, params.density * envelope)) continue;
-
-        let variants;
-        if (noise < 0.15) variants = '⠁';
-        else if (noise > 0.88) variants = '⠂';
-        else {
-          // Perpendicular to ∇ψ, tangent to the contour lines.
-          const [dxPsi, dyPsi] = streamGradient(x, y, t, index, iy);
-          let angle = Math.atan2(-dxPsi, dyPsi);
-          if (angle < 0) angle += Math.PI;
-          variants = angle < Math.PI / 8 || angle > 7 * Math.PI / 8 ? '⠤'
-            : angle < 3 * Math.PI / 8 ? '⠱'
-            : angle < 5 * Math.PI / 8 ? '⠇'
-            : '⠎';
-        }
-        const lum = (0.17 + 0.56 * bands + 0.12 * broad) * params.contrast;
-        const alpha = Math.max(0.045, Math.min(0.9, lum * (0.65 + 0.35 * grain)));
-        ctx.fillStyle = alphaColors[Math.round(alpha * 255)];
-        ctx.fillText(variants, px, py);
+    const vortices = positionVortices(flow, time);
+    const drift = time * flow.bands.speed;
+    for (let iy = 0; iy < grid.rows; iy++) {
+      for (let ix = 0; ix < grid.cols; ix++) {
+        const index = iy * grid.cols + ix, noise = grid.noise[index];
+        const sample = sampleFlow(grid, flow, vortices, ix, iy, time);
+        const bands = Math.pow(0.5 + 0.5 * Math.cos(sample.psi * flow.bands.frequency + drift), flow.bands.sharpness);
+        const broad = 0.5 + 0.5 * Math.sin(grid.broad[index] + time * style.broadSpeed);
+        const grain = grid.grain[index];
+        const envelope = style.densityBase + style.densityBands * bands + style.densityGrain * broad * grain;
+        if (noise > Math.min(style.maxDensity, params.density * envelope)) continue;
+        const glyph = noise < style.sparseGlyphThreshold ? '⠁'
+          : noise > style.lightGlyphThreshold ? '⠂' : directionGlyph(sample.dx, sample.dy);
+        const lum = (style.luminanceBase + style.luminanceBands * bands + style.luminanceBroad * broad) * params.contrast;
+        const alpha = Math.max(style.minAlpha, Math.min(style.maxAlpha, lum * (style.grainAlphaBase + style.grainAlphaWeight * grain)));
+        ctx.fillStyle = ALPHA_COLORS[Math.round(alpha * style.alphaSteps)];
+        ctx.fillText(glyph, ix * grid.cellW + grid.cellW * 0.5, iy * grid.cellH + grid.cellH * 0.5);
       }
     }
   }
 
-  function tick(now) {
-    if (!running) return;
-    frame = requestAnimationFrame(tick);
-    if (now - lastTime < 1000 / 24) return;
-    const dt = lastTime ? Math.min((now - lastTime) / 1000, 0.08) : 0;
-    lastTime = now;
-    elapsed += dt * params.speed;
-    draw(elapsed);
+  // Browser integration owns the mutable lifecycle; the passes above do not.
+  function startBackground(canvas, ctx) {
+    const params = { ...DEFAULTS };
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let grid = null, running = false, frame = 0, lastTime = 0, elapsed = 0;
+    function draw() { drawFrame(ctx, grid, FLOW, STYLE, params, elapsed); }
+    function rebuild() {
+      const size = initializeCanvas(canvas, ctx, window.devicePixelRatio, STYLE);
+      grid = size ? initializeFlowArrays(size, params.cellSize, FLOW, STYLE) : null;
+      draw();
+    }
+    function tick(now) {
+      if (!running) return;
+      frame = requestAnimationFrame(tick);
+      if (now - lastTime < 1000 / ANIMATION.framesPerSecond) return;
+      const dt = lastTime ? Math.min((now - lastTime) / 1000, ANIMATION.maxDeltaSeconds) : 0;
+      lastTime = now;
+      elapsed += dt * params.speed;
+      draw();
+    }
+    function syncAnimation() {
+      if (reducedMotion.matches || document.hidden || params.speed === 0) {
+        running = false;
+        cancelAnimationFrame(frame);
+        frame = 0;
+        draw();
+      } else if (!running) {
+        running = true;
+        lastTime = 0;
+        frame = requestAnimationFrame(tick);
+      }
+    }
+    if (reducedMotion.addEventListener) reducedMotion.addEventListener('change', syncAnimation);
+    else reducedMotion.addListener(syncAnimation);
+    document.addEventListener('visibilitychange', syncAnimation);
+    new ResizeObserver(rebuild).observe(canvas);
+    setupSettings(params, () => { draw(); syncAnimation(); }, () => { rebuild(); syncAnimation(); });
+    rebuild();
+    syncAnimation();
   }
-  function stop() { running = false; cancelAnimationFrame(frame); frame = 0; }
-  function start() {
-    if (running) return;
-    running = true; lastTime = 0;
-    frame = requestAnimationFrame(tick);
-  }
-  function syncAnimation() {
-    if (prefersReducedMotion.matches || document.hidden || params.speed === 0) {
-      stop(); draw(elapsed);
-    } else start();
-  }
-  if (prefersReducedMotion.addEventListener) prefersReducedMotion.addEventListener('change', syncAnimation);
-  else prefersReducedMotion.addListener(syncAnimation);
-  document.addEventListener('visibilitychange', syncAnimation);
-  const resizeObserver = new ResizeObserver(measure);
-  resizeObserver.observe(canvas);
 
-  const toggle = document.getElementById('settings-toggle');
-  const settings = document.getElementById('flow-settings');
-  const close = document.getElementById('settings-close');
-  function showSettings(open) {
-    settings.hidden = !open;
-    toggle.setAttribute('aria-expanded', String(open));
-  }
-  toggle.addEventListener('click', () => showSettings(settings.hidden));
-  close.addEventListener('click', () => showSettings(false));
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') showSettings(false); });
-  for (const [id, key] of [['density','density'],['speed','speed'],['contrast','contrast'],['cell-size','cellSize']]) {
-    document.getElementById(id).addEventListener('input', e => {
-      params[key] = Number(e.target.value);
-      if (key === 'cellSize') measure();
-      else { draw(elapsed); syncAnimation(); }
+  function setupSettings(params, redraw, rebuild) {
+    const toggle = document.getElementById('settings-toggle');
+    const settings = document.getElementById('flow-settings');
+    const close = document.getElementById('settings-close');
+    if (!toggle || !settings || !close) return;
+    const controls = [['density', 'density'], ['speed', 'speed'], ['contrast', 'contrast'], ['cell-size', 'cellSize']]
+      .map(([id, key]) => [document.getElementById(id), key]);
+    const reset = document.getElementById('settings-reset');
+    function showSettings(open) {
+      settings.hidden = !open;
+      toggle.setAttribute('aria-expanded', String(open));
+    }
+    toggle.addEventListener('click', () => showSettings(settings.hidden));
+    close.addEventListener('click', () => showSettings(false));
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') showSettings(false); });
+    for (const [control, key] of controls) {
+      if (!control) continue;
+      control.addEventListener('input', e => {
+        params[key] = Number(e.target.value);
+        if (key === 'cellSize') rebuild();
+        else redraw();
+      });
+    }
+    if (reset) reset.addEventListener('click', () => {
+      Object.assign(params, DEFAULTS);
+      for (const [control, key] of controls) if (control) control.value = DEFAULTS[key];
+      rebuild();
     });
   }
-  document.getElementById('settings-reset').addEventListener('click', () => {
-    Object.assign(params, defaults);
-    for (const [id, key] of [['density','density'],['speed','speed'],['contrast','contrast'],['cell-size','cellSize']]) document.getElementById(id).value = defaults[key];
-    measure(); syncAnimation();
-  });
-  measure();
-  syncAnimation();
+
+  const canvas = document.getElementById('ascii-flow');
+  const ctx = canvas && canvas.getContext('2d', { alpha: false });
+  if (ctx) startBackground(canvas, ctx);
 })();
