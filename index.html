@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a0b0d">
+  <meta name="description" content="Morse Code">
+  <title>Morse Code</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/ascii-flow.js" defer></script>
+  <script src="assets/navigation.js" defer></script>
+</head>
+<body>
+  <main>
+    <canvas id="ascii-flow" aria-hidden="true"></canvas>
+    <header class="topbar">
+      <a class="wordmark" href="#top" aria-label="Morse Code"><span class="wordmark-full">MORSE CODE</span><span class="wordmark-short" aria-hidden="true">MC</span></a>
+      <span class="location"> NYC  </span>
+    </header>
+    <section class="hero" id="top" aria-label="Morse Code home">
+      <div class="hero-shade" aria-hidden="true"></div>
+      <div class="hero-center">
+        <div class="eyebrow">RESEARCH ENGINEERING CONSULTING</div>
+        <h1>Morse Code</h1>
+        <p>Applied research and engineering for computational systems.</p>
+        <div class="nav-slot"><nav class="hero-nav" aria-label="Main navigation">
+          <a href="#about">About</a>
+          <a href="#expertise">Expertise</a>
+          <a href="#contact">Contact</a>
+        </nav></div>
+      </div>
+      <div class="hero-bottom">
+        <span class="hero-bottom-text">SIMULATION <span>/</span> ML SYSTEMS 
+            <span>/</span> HIGH-PERFORMANCE COMPUTING<span>/</span> GPU
+            PERFORMANCE <span>/</span> LLM INFERENCE </span>
+        <button class="settings-toggle" id="settings-toggle" type="button" aria-controls="flow-settings" aria-expanded="false" aria-label="Customize animation">[ tune ]</button>
+      </div>
+      <aside class="settings" id="flow-settings" hidden aria-label="Animation settings">
+        <div class="settings-head"><span>PARAMETERS</span><button type="button" id="settings-close" aria-label="Close settings">×</button></div>
+        <label>Density <input id="density" type="range" min="0.3" max="1" step="0.05" value="1"></label>
+        <label>Speed <input id="speed" type="range" min="0" max="2.5" step="0.1" value="0.9"></label>
+        <label>Contrast <input id="contrast" type="range" min="0.4" max="1.8" step="0.1" value="1.1"></label>
+        <label>Cell size <input id="cell-size" type="range" min="8" max="19" step="1" value="8"></label>
+        <button class="settings-reset" type="button" id="settings-reset">Reset defaults</button>
+      </aside>
+    </section>
+
+    <div class="content">
+      <section class="content-section" id="about">
+        <div class="section-index">01 / ABOUT</div>
+        <div class="about-content">
+          <img class="about-photo" src="assets/IMG_7049.jpg" alt="Portrait of Matt Morse">
+          <div><p>Morse Code designs, builds, and optimizes systems with demanding computational requirements, with expertise in numerical algorithms, high-performance computing, GPU performance, and ML systems. 
+              We collaborate closely with clients to determine if and how improved computation can deliver value and work together on a solution, taking research prototypes through to production.</p>
+              <p>Morse Code was founded by Matt Morse, a research engineer with over a decade of experience working on computational systems in research and production settings. 
+              He has a computer science PhD from NYU Courant and has worked in AI research and quantitative finance.</p></div>
+        </div>
+      </section>
+      <section class="content-section" id="expertise">
+        <div class="section-index">02 / EXPERTISE</div>
+        <div><div class="pill-list"><span>Scientific computing</span><span>GPU &amp; HPC optimization</span><span>Physics-based simulation</span><span>ML systems</span><span>LLM inference</span></div></div>
+      </section>
+      <section class="content-section" id="contact">
+        <div class="section-index">03 / CONTACT</div>
+        <div>
+          <form class="contact-form" action="mailto:hello@morsecode.sh" method="post" enctype="text/plain">
+            <label for="contact-name">Name</label>
+            <input id="contact-name" name="name" autocomplete="name" required>
+            <label for="contact-email">Email</label>
+            <input id="contact-email" name="email" type="email" autocomplete="email" required>
+            <label for="contact-message">Message</label>
+            <textarea id="contact-message" name="message" rows="5" required></textarea>
+            <button type="submit">Get in touch ↗</button>
+          </form>
+        </div>
+      </section>
+      <footer><span>© 2026 MORSE CODE</span><a href="#top">BACK TO TOP ↑</a></footer>
+    </div>
+  </main>
+</body>
+</html>
