@@ -42,7 +42,7 @@
     contourInterval: 0.005, glyphAspectRatio: 1.28,
     backgroundColor: '#0a0b0d', glyphColor: '218,224,227',
     font: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
-    defaults: Object.freeze({ density: .8, speed: 0.2, contrast: 1.1, cellSize: 8 })
+    defaults: Object.freeze({ density: 1, speed: 0.2, contrast: 1.1, cellSize: 8 })
   });
 
   // Numerical core -----------------------------------------------------------
