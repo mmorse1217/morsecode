@@ -22,8 +22,9 @@
    * @property {Float64Array} v Borrowed y-face velocities; never mutate.
    * @property {Float64Array[]} tracers Borrowed cell-centered fields; never mutate.
    *
-   * @typedef {{density: number, speed: number, contrast: number, cellSize: number}} FlowSettings
+   * @typedef {{density: number, speed: number, viscosity: number, contrast: number, cellSize: number}} FlowSettings
    * Speed is model-time units per active wall-clock second; cellSize is CSS px.
+   * Viscosity is a nondimensional model coefficient.
    *
    * @typedef {{width: number, height: number, dpr: number}} Viewport
    * Width and height are CSS px. DPR affects only the backing bitmap.
@@ -37,13 +38,15 @@
   // Appearance tuning. Values are nondimensional unless marked as CSS pixels.
   // Stability limits and resource caps are intentionally kept separate below.
   const APPEARANCE = Object.freeze({
-    viscosity: 0.003, tracerDiffusivity: 0.0002, tracerDecay: 0.035,
+    tracerDiffusivity: 0.0002, tracerDecay: 0.035,
     sourceStrength: 0.10, forceStrengths: [0.0025, 0.0018, 0.0012],
     contourInterval: 0.005, glyphAspectRatio: 1.28,
     backgroundColor: '#0a0b0d', glyphColor: '218,224,227',
     font: '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
-    defaults: Object.freeze({ density: 1, speed: 0.2, contrast: 1.1, cellSize: 8 })
+    defaults: Object.freeze({ density: 1, speed: 0.4, viscosity: 0.003, contrast: 1.1, cellSize: 8 })
   });
+  // Keep these bounds in sync with the viscosity range input in index.html.
+  const MIN_UI_VISCOSITY = 0.0005, MAX_UI_VISCOSITY = 0.01;
 
   // Numerical core -----------------------------------------------------------
 
@@ -262,13 +265,15 @@
   // scratch arrays only during the call and must not retain them. view() fields
   // are read-only by contract: reacquire after step() swaps buffers. A step
   // publishes all new fields and its exact time increment only after validation.
+  // setViscosity changes the coefficient for the next step without resetting state.
   function createFluidSolver(options) {
     const { nx, ny, Lx, Ly } = options;
     if (![nx, ny].every(n => Number.isInteger(n) && n >= 16 && n <= 128 && (n & (n - 1)) === 0) ||
         nx * ny > 8192 || !Number.isFinite(Lx) || !Number.isFinite(Ly) || Lx <= 0 || Ly <= 0) {
       throw new RangeError('Invalid fluid grid or domain');
     }
-    const viscosity = options.viscosity ?? 0, diffusivity = options.tracerDiffusivity ?? 0;
+    let viscosity = options.viscosity ?? 0;
+    const diffusivity = options.tracerDiffusivity ?? 0;
     const decay = options.tracerDecay ?? 0;
     if (![viscosity, diffusivity, decay].every(n => Number.isFinite(n) && n >= 0)) {
       throw new RangeError('Diffusion and decay must be finite and nonnegative');
@@ -397,15 +402,15 @@
       }
     }
     // Build the candidate velocity without modifying the published fields.
-    function prepareVelocityStep(stepSize) {
+    function prepareVelocityStep(stepSize, stepViscosity) {
       advectVelocityField(u, velocityWorkU, 0, 0.5, stepSize);
       advectVelocityField(v, velocityWorkV, 0.5, 0, stepSize);
       forceU.fill(0); forceV.fill(0);
       if (forcing) forcing(time + stepSize / 2, forceU, forceV);
       for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
         const k = index(i, j);
-        nextU[k] = velocityWorkU[k] + stepSize * (viscosity * laplacian(velocityWorkU, i, j) + forceU[k]);
-        nextV[k] = velocityWorkV[k] + stepSize * (viscosity * laplacian(velocityWorkV, i, j) + forceV[k]);
+        nextU[k] = velocityWorkU[k] + stepSize * (stepViscosity * laplacian(velocityWorkU, i, j) + forceU[k]);
+        nextV[k] = velocityWorkV[k] + stepSize * (stepViscosity * laplacian(velocityWorkV, i, j) + forceV[k]);
       }
       // Reuse the advection buffers for the projected velocity.
       project(nextU, nextV, velocityWorkU, velocityWorkV, stepSize);
@@ -432,13 +437,18 @@
 
     return {
       stableStepLimit,
+      setViscosity(nextViscosity) {
+        if (!Number.isFinite(nextViscosity) || nextViscosity < 0) throw new RangeError('Invalid viscosity');
+        viscosity = nextViscosity;
+      },
       step(stepSize) {
         const limit = stableStepLimit();
         if (limit < 1e-5) throw new Error('Fluid stability step is too small');
         if (!Number.isFinite(stepSize) || stepSize <= 0 || stepSize > limit * (1 + 1e-12)) {
           throw new RangeError('Unsafe fluid step');
         }
-        prepareVelocityStep(stepSize);
+        // Capture the coefficient so a callback cannot change it mid-step.
+        prepareVelocityStep(stepSize, viscosity);
         transportTracers(stepSize); // Uses the unmodified old velocity and tracers.
         commitStep(stepSize);
       },
@@ -537,7 +547,7 @@
       initialV[k] = -(initialStream[index(i + 1, j)] - initialStream[k]) / dx;
     }
     return createFluidSolver({
-      nx, ny, Lx, Ly, viscosity: APPEARANCE.viscosity,
+      nx, ny, Lx, Ly, viscosity: APPEARANCE.defaults.viscosity,
       tracerDiffusivity: APPEARANCE.tracerDiffusivity, tracerDecay: APPEARANCE.tracerDecay,
       initialVelocity: { u: initialU, v: initialV },
       initialTracers: [
@@ -937,9 +947,13 @@
     const panel = doc.getElementById('flow-settings');
     const close = doc.getElementById('settings-close');
     if (!toggle || !panel || !close) return { showSpeedLimit() {}, destroy() {} };
-    const controls = [['density', 'density'], ['speed', 'speed'], ['contrast', 'contrast'], ['cell-size', 'cellSize']]
+    const controls = [['density', 'density'], ['speed', 'speed'], ['viscosity', 'viscosity'],
+      ['contrast', 'contrast'], ['cell-size', 'cellSize']]
       .map(([id, key]) => [doc.getElementById(id), key]);
     const reset = doc.getElementById('settings-reset');
+    const viscosityControl = doc.getElementById('viscosity');
+    const viscositySetting = doc.getElementById('viscosity-setting');
+    if (viscositySetting && viscosityControl) viscositySetting.hidden = false;
     const speedNote = doc.createElement('p');
     speedNote.className = 'flow-quality-note';
     speedNote.hidden = true;
@@ -977,6 +991,7 @@
       destroy() {
         for (const remove of listeners.splice(0)) remove();
         speedNote.remove();
+        if (viscositySetting) viscositySetting.hidden = true;
       },
       showSpeedLimit(limited) {
         const text = limited ? 'Speed limited to keep the page responsive.' : '';
@@ -1027,6 +1042,7 @@
         if (!nextViewport) fluid = null;
         else if (!viewport || width !== viewport.width || height !== viewport.height) {
           fluid = createDefaultFluid(width, height);
+          fluid.setViscosity(settings.viscosity);
         }
         viewport = nextViewport;
         const result = renderer.resize(viewport, fluid, settings.cellSize);
@@ -1037,12 +1053,16 @@
     /** @param {Partial<FlowSettings>} patch */
     function applySettings(patch) {
       const nextSettings = { ...settings, ...patch };
-      if (![nextSettings.density, nextSettings.speed, nextSettings.contrast, nextSettings.cellSize].every(Number.isFinite) ||
-          nextSettings.density < 0 || nextSettings.speed < 0 || nextSettings.contrast < 0 || nextSettings.cellSize < 1) return;
+      if (![nextSettings.density, nextSettings.speed, nextSettings.viscosity, nextSettings.contrast,
+        nextSettings.cellSize].every(Number.isFinite) || nextSettings.density < 0 || nextSettings.speed < 0 ||
+        nextSettings.viscosity < MIN_UI_VISCOSITY || nextSettings.viscosity > MAX_UI_VISCOSITY ||
+        nextSettings.contrast < 0 || nextSettings.cellSize < 1) return;
       Object.assign(settings, patch);
       try {
+        if (Object.hasOwn(patch, 'viscosity') && fluid) fluid.setViscosity(settings.viscosity);
         if (Object.hasOwn(patch, 'cellSize')) renderer.resize(viewport, fluid, settings.cellSize);
-        if (Object.hasOwn(patch, 'cellSize') || Object.hasOwn(patch, 'speed')) playback.resetRate();
+        if (Object.hasOwn(patch, 'cellSize') || Object.hasOwn(patch, 'speed') ||
+            Object.hasOwn(patch, 'viscosity')) playback.resetRate();
         renderer.draw(settings);
         syncPlayback();
       } catch (error) { stopWithError(error); }

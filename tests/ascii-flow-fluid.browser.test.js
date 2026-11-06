@@ -148,13 +148,53 @@ test('fluid background honors controls, screen limits, and sustained motion', {
   await sleep(300); // Let the initial ResizeObserver notification settle.
   const reduced = await count();
   assert.ok(reduced > 0, 'reduced motion still needs an initial frame');
+  const buttonBackdrop = await evaluate(`(() => {
+    const style = getComputedStyle(document.getElementById('settings-toggle'), '::before');
+    const center = getComputedStyle(document.querySelector('.hero-shade')).backgroundImage;
+    const stops = background => (background.match(/rgba\\([^)]*\\)\\s+\\d+%/g) || []).slice(0, 4);
+    return { background: style.backgroundImage, pointerEvents: style.pointerEvents,
+      buttonStops: stops(style.backgroundImage), centerStops: stops(center) };
+  })()`);
+  assert.match(buttonBackdrop.background, /^radial-gradient\(/, 'settings button should have a soft backdrop');
+  assert.equal(buttonBackdrop.buttonStops.length, 4);
+  assert.deepEqual(buttonBackdrop.buttonStops, buttonBackdrop.centerStops, 'button and center should use the same shade');
+  assert.equal(buttonBackdrop.pointerEvents, 'none', 'the backdrop must not intercept input');
+  // Deliberately overlap an opaque specialty marker and the button backdrop.
+  // Inspect a rendered pixel, not just z-index values, to catch stacking-context regressions.
+  await evaluate(`(() => {
+    const fixture = document.createElement('div');
+    fixture.id = 'backdrop-layer-test'; fixture.className = 'hero-bottom';
+    fixture.setAttribute('aria-hidden', 'true');
+    fixture.style.cssText = 'position:fixed;z-index:9999;top:0;left:0;width:160px;height:100px;min-height:0;padding:0;margin:0;background:white';
+    fixture.innerHTML = '<span class="hero-bottom-text" style="position:absolute;top:45px;left:75px;width:10px;height:10px;background:red"></span>' +
+      '<button class="settings-toggle" style="top:25px;left:40px;right:auto;bottom:auto;width:80px;height:50px;padding:0"></button>';
+    document.body.append(fixture);
+  })()`);
+  const screenshot = await send('Page.captureScreenshot', { format: 'png', clip: { x: 60, y: 50, width: 21, height: 1, scale: 1 } });
+  const backdropPixels = await evaluate(`(async () => {
+    const image = new Image(); image.src = ${JSON.stringify('data:image/png;base64,')} + ${JSON.stringify(screenshot.data)};
+    await image.decode();
+    const canvas = document.createElement('canvas'); canvas.width = 21; canvas.height = 1;
+    const ctx = canvas.getContext('2d'); ctx.drawImage(image, 0, 0);
+    const pixels = ctx.getImageData(0, 0, 21, 1).data;
+    return { shade: Array.from(pixels.slice(0, 4)), marker: Array.from(pixels.slice(80, 84)) };
+  })()`);
+  await evaluate("document.getElementById('backdrop-layer-test').remove()");
+  assert.ok(backdropPixels.shade.slice(0, 3).every(value => value < 100), 'the backdrop must still darken its background');
+  assert.deepEqual(backdropPixels.marker, [255, 0, 0, 255], 'the backdrop must be behind the specialties');
   assert.deepEqual(await evaluate("Array.from(document.scripts, s => s.getAttribute('src')).filter(s => s && s.includes('ascii-flow'))"),
     ['assets/ascii-flow-fluid.js'], 'the actual landing page must select only the reviewed fluid renderer');
   assert.deepEqual(await evaluate(`(() => {
     const speed = document.getElementById('speed');
     return { value: speed.value, defaultValue: speed.defaultValue, min: speed.min, step: speed.step };
-  })()`), { value: '0.2', defaultValue: '0.2', min: '0', step: '0.1' },
-  'default to the third slider position, counting zero as the lowest');
+  })()`), { value: '0.4', defaultValue: '0.4', min: '0', step: '0.1' },
+  'default to a model-time speed of 0.4');
+  assert.deepEqual(await evaluate(`(() => {
+    const viscosity = document.getElementById('viscosity');
+    return { value: viscosity.value, min: viscosity.min, max: viscosity.max, step: viscosity.step };
+  })()`), { value: '0.003', min: '0.0005', max: '0.01', step: '0.0005' });
+  assert.equal(await evaluate("document.getElementById('viscosity-setting').hidden"), false);
+  assert.equal(await evaluate("document.getElementById('viscosity-setting').textContent.trim()"), 'Viscosity');
   const batching = await evaluate(`(() => {
     window.__captureBatch = false;
     const canvas = document.getElementById('ascii-flow'), ctx = canvas.getContext('2d');
@@ -215,6 +255,11 @@ test('fluid background honors controls, screen limits, and sustained motion', {
   const stopped = await count(), before = await hash();
   await sleep(300);
   assert.equal(await count(), stopped, 'zero speed must stop animation');
+  for (const viscosity of ['0.0005', '0.01']) {
+    await setControl('viscosity', viscosity);
+    assert.equal(await evaluate("document.getElementById('viscosity').value"), viscosity);
+    assert.equal(await hash(), before, 'changing viscosity must not reset or advance the simulation');
+  }
   await setControl('contrast', '1.8');
   await setControl('contrast', '1.1');
   await setControl('cell-size', '11');
@@ -227,8 +272,9 @@ test('fluid background honors controls, screen limits, and sustained motion', {
     speed.value = '0'; speed.dispatchEvent(new Event('input', { bubbles: true }));
     return restored;
   })()`);
-  assert.equal(resetSpeed, '0.2', 'Reset defaults must restore the slower model-time speed');
+  assert.equal(resetSpeed, '0.4', 'Reset defaults must restore the default model-time speed');
   assert.equal(await evaluate("document.getElementById('density').value"), '1');
+  assert.equal(await evaluate("document.getElementById('viscosity').value"), '0.003');
   assert.equal(await hash(), before, 'reset restores settings without reseeding the simulation');
   await evaluate("window.dispatchEvent(new Event('resize'))");
   await sleep(100);
@@ -344,6 +390,38 @@ test('fluid background honors controls, screen limits, and sustained motion', {
   }
   assert.ok(ready, 'controlled-clock preview did not start');
   await evaluate('window.__captureContour = false; window.__captureBatch = false');
+  // Run from the same seed with each viscosity. A resize/reseed between
+  // choosing viscosity and advancing must preserve the selected coefficient.
+  const viscosityRuns = await evaluate(`(() => {
+    const canvas = document.getElementById('ascii-flow');
+    function setInput(id, value) {
+      const input = document.getElementById(id);
+      input.value = value;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    function run(viscosity, resize) {
+      window.AsciiFluid.mount(canvas)();
+      window.AsciiFluid.mount(canvas);
+      setInput('speed', '0');
+      setInput('viscosity', viscosity);
+      if (resize) {
+        canvas.style.width = '200px'; window.dispatchEvent(new Event('resize'));
+        canvas.style.width = ''; window.dispatchEvent(new Event('resize'));
+      }
+      setInput('speed', '0.4');
+      window.__advanceFrames(100);
+      const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      let hash = 2166136261;
+      for (let i = 0; i < data.length; i += 16) hash = Math.imul(hash ^ data[i], 16777619);
+      return hash;
+    }
+    const result = { high: run('0.01', false), highResized: run('0.01', true), low: run('0.0005', true) };
+    window.AsciiFluid.mount(canvas)();
+    window.AsciiFluid.mount(canvas);
+    return result;
+  })()`);
+  assert.equal(viscosityRuns.highResized, viscosityRuns.high, 'resize must retain the selected viscosity');
+  assert.notEqual(viscosityRuns.low, viscosityRuns.high, 'viscosity should affect the evolving flow');
   await sleep(200);
   const motion = await evaluate(`(() => {
     const canvas = document.getElementById('ascii-flow'), ctx = canvas.getContext('2d');
@@ -499,7 +577,7 @@ test('fluid background honors controls, screen limits, and sustained motion', {
     assert.equal(await evaluate('location.href'), destination, 'keep a single maintained landing page');
     assert.deepEqual(await evaluate("Array.from(document.scripts, s => s.getAttribute('src')).filter(s => s && s.includes('ascii-flow'))"),
       ['assets/ascii-flow-fluid.js'], 'the saved preview must select only the reviewed fluid renderer');
-    assert.equal(await evaluate("document.getElementById('speed').value"), '0.2');
+    assert.equal(await evaluate("document.getElementById('speed').value"), '0.4');
     const start = await count();
     await evaluate('window.__advanceFrames(10)');
     assert.ok(await count() > start, 'the saved preview must animate');
@@ -516,6 +594,8 @@ test('fluid background honors controls, screen limits, and sustained motion', {
     assert.ok(ready, `${route} fallback should still render`);
     assert.deepEqual(await evaluate("Array.from(document.scripts, s => s.getAttribute('src')).filter(s => s && s.includes('ascii-flow'))"),
       [`assets/${script}`], 'each preview must select exactly one background script');
+    assert.equal(await evaluate("document.getElementById('viscosity-setting').hidden"), true,
+      'backgrounds without a viscosity control must not show it');
     const start = await count();
     await evaluate('window.__advanceFrames(10)');
     assert.ok(await count() > start, `${route} fallback should animate`);

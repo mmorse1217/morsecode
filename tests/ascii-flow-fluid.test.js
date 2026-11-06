@@ -266,6 +266,55 @@ test('projection preserves a divergence-free force while removing its gradient c
   }
 });
 
+test('viscosity changes affect the next stable step without resetting fluid state', () => {
+  const options = { nx: 64, ny: 64, Lx: 1, Ly: 1, viscosity: 0.003,
+    initialVelocity: { u: (x, y) => 0.05 * Math.sin(2 * Math.PI * y), v: 0 }, initialTracers: [0.4] };
+  const low = createFluidSolver(options), high = createFluidSolver(options);
+  low.step(0.005); high.step(0.005);
+  const before = high.view(), savedU = before.u.slice(), savedTracer = before.tracers[0].slice();
+  const originalLimit = high.stableStepLimit();
+  low.setViscosity(0.0005);
+  high.setViscosity(0.01);
+  assert.strictEqual(high.view().u, before.u, 'changing viscosity must not replace the velocity buffer');
+  assert.equal(high.view().time, before.time);
+  assert.deepEqual(high.view().u, savedU);
+  assert.deepEqual(high.view().tracers[0], savedTracer);
+  const highLimit = high.stableStepLimit();
+  assert.ok(highLimit < originalLimit, 'higher viscosity requires a smaller stable step');
+  assert.throws(() => high.step(highLimit * 1.01), /unsafe/i);
+  for (const invalid of [-1, NaN, Infinity]) assert.throws(() => high.setViscosity(invalid), /viscosity/i);
+  assert.equal(high.stableStepLimit(), highLimit, 'invalid updates leave viscosity unchanged');
+  low.step(0.005); high.step(0.005);
+  const energy = fluid => fluid.view().u.reduce((sum, value) => sum + value * value, 0);
+  assert.ok(energy(high) < energy(low), 'higher viscosity should damp the same shear flow faster');
+});
+
+test('default flow remains finite at both viscosity control limits', () => {
+  for (const [width, height] of [[390, 844], [1440, 900]]) {
+    for (const viscosity of [0.0005, 0.01]) {
+      const fluid = createDefaultFluid(width, height);
+      fluid.setViscosity(viscosity);
+      while (fluid.view().time < 2 - 1e-12) {
+        fluid.step(Math.min(fluid.stableStepLimit(), 2 - fluid.view().time));
+      }
+      const state = fluid.view();
+      assert.ok(state.u.every(Number.isFinite) && state.v.every(Number.isFinite));
+      assert.ok(state.tracers.every(field => field.every(value => Number.isFinite(value) && value >= -1e-12)));
+    }
+  }
+});
+
+test('a viscosity change inside a callback takes effect on the following step', () => {
+  const options = { nx: 64, ny: 64, Lx: 1, Ly: 1, viscosity: 0,
+    initialVelocity: { u: (x, y) => 0.05 * Math.sin(2 * Math.PI * y), v: 0 }, initialTracers: [0] };
+  let fluid;
+  fluid = createFluidSolver({ ...options, forcing() { fluid.setViscosity(0.01); } });
+  const reference = createFluidSolver(options);
+  fluid.step(0.03); reference.step(0.03);
+  assert.deepEqual(fluid.view().u, reference.view().u, 'the in-progress step uses its original viscosity');
+  assert.ok(fluid.stableStepLimit() < 0.03, 'the next step uses the updated stability limit');
+});
+
 test('viscous Taylor–Green flow converges toward the analytical solution', () => {
   function error(n) {
     const L = 2 * Math.PI, viscosity = 0.1;
