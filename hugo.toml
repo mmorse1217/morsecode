@@ -1,0 +1,13 @@
+baseURL = 'https://morsecode.sh/'
+locale = 'en-us'
+title = 'Morse Code'
+theme = 'shibui'
+
+[params.author]
+  name = 'Morse Code'
+
+[menu]
+  [[menu.main]]
+    name = 'About'
+    url = '/#about'
+    weight = 1
