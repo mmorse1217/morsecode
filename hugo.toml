@@ -11,3 +11,16 @@ theme = 'shibui'
     name = 'About'
     url = '/#about'
     weight = 1
+
+  [[menu.footer]]
+    name = 'LinkedIn'
+    url = 'https://www.linkedin.com/in/matthewjmorse/'
+    weight = 1
+  [[menu.footer]]
+    name = 'Google Scholar'
+    url = 'https://scholar.google.com/citations?user=wtaBtd8AAAAJ&hl=en&oi=ao'
+    weight = 2
+  [[menu.footer]]
+    name = 'GitHub'
+    url = 'https://github.com/mmorse1217'
+    weight = 3

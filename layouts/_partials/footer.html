@@ -1,0 +1,7 @@
+<p role="contentinfo">
+  &copy; {{ now.Year }} Morse Code
+  {{ range .Site.Menus.footer }}
+    &middot; <a href="{{ .URL }}" rel="me">{{ .Name }}</a>
+  {{ end }}
+  &middot; <a href="https://github.com/ntk148v/shibui">shibui</a>
+</p>
